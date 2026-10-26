@@ -16,7 +16,7 @@ set -euo pipefail
 
 # ==================== 变量区（运行前按环境填写） ====================
 # --- 下载/安装相关 ---
-# 安装包直链（华为内网 artifactory）。两个包各自一个 URL，改动只在这里改链接即可：
+# 安装包直链。两个包各自一个 URL：
 DEVKITAI_URL="${DEVKITAI_URL:-}"   # devkitai 后端
 TUI_URL="${TUI_URL:-}"   # TUI 前端
 
