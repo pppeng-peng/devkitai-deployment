@@ -17,8 +17,8 @@ set -euo pipefail
 # ==================== 变量区（运行前按环境填写） ====================
 # --- 下载/安装相关 ---
 # 安装包直链（华为内网 artifactory）。两个包各自一个 URL，改动只在这里改链接即可：
-DEVKITAI_URL="${DEVKITAI_URL:-https://cmc-szver-artifactory.cmc.tools.huawei.com/artifactory/cmc-software-snapshot/Kunpeng%20DevKit/Kunpeng%20DevKit%2026/Kunpeng%20DevKit%2026.2.RC1.B021-20261021163303/DevKit-AI-26.2.RC1-Linux-Kunpeng.tar.gz}"   # devkitai 后端
-TUI_URL="${TUI_URL:-https://cmc-szver-artifactory.cmc.tools.huawei.com/artifactory/cmc-software-snapshot/Kunpeng%20DevKit/Kunpeng%20DevKit%2026/Kunpeng%20DevKit%2026.3.T1.B025-20261019162910/DevKit-AI-TUI-26.3.T1-Linux-Kunpeng.tar.gz}"   # TUI 前端
+DEVKITAI_URL="${DEVKITAI_URL:-}"   # devkitai 后端
+TUI_URL="${TUI_URL:-}"   # TUI 前端
 
 DEVKITAI_FNAME="${DEVKITAI_FNAME:-}"
 TUI_FNAME="${TUI_FNAME:-}"
