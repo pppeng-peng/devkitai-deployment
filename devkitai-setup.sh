@@ -1,41 +1,37 @@
 #!/usr/bin/env bash
 #
 # DevKit AI 一体化安装配置脚本（在目标鲲鹏服务器上运行）
-# 职责：下载包 → 安装（devkitai 本体 / skills 包 / TUI）→ 配置 config.yaml → 更新 skills → 启动 server
+# 职责：下载包 → 安装（devkitai 本体 / TUI）→ 配置 config.yaml → 更新 skills → 启动 server
 #
-# 用法：$0 [all|download|install|config|update|start]
+# 用法：$0 [all|start|stop|restart|uninstall|-h|--help]
 #   all      = download && install && config && update && start（默认）
-#   download = 下载 devkitai / skills / TUI 安装包
-#   install  = 安装 devkitai 本体、skills 包、TUI
-#   config   = 交互式配置 config.yaml（模型 / 上下文 / server 端口）
-#   update   = 更新 skills
 #   start    = 启动 devkitai server（就绪轮询），并可联动启动 TUI
+#   stop     = 停止 devkitai server
+#   restart  = 重新配置并启动（config + start）
+#   uninstall = 卸载 devkitai（停服、清理命令 / 环境变量 / 数据目录）
+#   -h/--help = 显示本帮助
+#   <子命令> -h/--help = 显示该子命令的作用说明
 #
 set -euo pipefail
 
 # ==================== 变量区（运行前按环境填写） ====================
 # --- 下载/安装相关 ---
-# devkitai 后端安装包直链（华为云 OBS）
-DEVKITAI_URL="${DEVKITAI_URL:-https://kunpeng-repo.obs.cn-north-4.myhuaweicloud.com/Kunpeng%20DevKit/Kunpeng%20DevKit%2026.2.T103/DevKit-AI-26.2.T103-Linux-Kunpeng.tar.gz}"
-SKILLS_URL="${SKILLS_URL:-}"
-# TUI 前端：默认留空，运行时通过 GitCode releases API 自动解析；也可用 TUI_URL 显式指定直链
-TUI_URL="${TUI_URL:-}"
-TUI_REPO="${TUI_REPO:-Blackn/DevKit_AI_Frontend_Release}"  # TUI 的 GitCode 仓库（owner/repo）
-TUI_VERSION="${TUI_VERSION:-0.4.3}"                        # 解析失败时兜底使用的版本号
+# 安装包直链（华为内网 artifactory）。两个包各自一个 URL，改动只在这里改链接即可：
+DEVKITAI_URL="${DEVKITAI_URL:-https://cmc-szver-artifactory.cmc.tools.huawei.com/artifactory/cmc-software-snapshot/Kunpeng%20DevKit/Kunpeng%20DevKit%2026/Kunpeng%20DevKit%2026.2.RC1.B021-20261021163303/DevKit-AI-26.2.RC1-Linux-Kunpeng.tar.gz}"   # devkitai 后端
+TUI_URL="${TUI_URL:-https://cmc-szver-artifactory.cmc.tools.huawei.com/artifactory/cmc-software-snapshot/Kunpeng%20DevKit/Kunpeng%20DevKit%2026/Kunpeng%20DevKit%2026.3.T1.B025-20261019162910/DevKit-AI-TUI-26.3.T1-Linux-Kunpeng.tar.gz}"   # TUI 前端
 
 DEVKITAI_FNAME="${DEVKITAI_FNAME:-}"
-SKILLS_FNAME="${SKILLS_FNAME:-}"
 TUI_FNAME="${TUI_FNAME:-}"
 
 LOGIN_USER="${LOGIN_USER:-${SUDO_USER:-${USER:-$(id -un)}}}"
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/devkitai}"   # devkitai 本体安装目录
-PUSH_DIR="${PUSH_DIR:-${HOME}/.devkitai/pkgs}"   # skills 包存放目录
 DOWN_DIR="${DOWN_DIR:-${HOME}/.devkitai/downloads}"
 
 # --- 配置相关 ---
 CONFIG_YAML="${CONFIG_YAML:-}"   # 默认自动指向 devkitai 解压目录内 config/config.yaml
 
-# 默认获取当前 host IP
+# 默认获取当前 host IP（多 IP 时由 choose_host_bind 交互选择；HOST_BIND 环境变量可显式覆盖）
+HOST_BIND_ENV="${HOST_BIND:-}"
 IFACE_IP="$(hostname -I 2>/dev/null | awk '{print $1}')" || true
 [ -n "${IFACE_IP}" ] || IFACE_IP="0.0.0.0"
 HOST_BIND="${HOST_BIND:-${IFACE_IP}}"
@@ -48,13 +44,19 @@ CHAT_MODEL_NAME="${CHAT_MODEL_NAME:-}"
 CHAT_MODEL_PROVIDER="${CHAT_MODEL_PROVIDER:-}"
 CHAT_MODEL_ID="${CHAT_MODEL_ID:-}"
 CHAT_BASE_URL="${CHAT_BASE_URL:-}"
-CHAT_API_KEY_PLAIN="${CHAT_API_KEY_PLAIN:-}"
+# api_key：16.x/26.x 新版本要求先用 ./devkitai encrypt 加密得到密文（CHAT_API_KEY_ENC）才能写入 config.yaml
+CHAT_API_KEY_ENC="${CHAT_API_KEY_ENC:-}"
 
 # 上下文最大 Token 默认值
 MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS:-1000000}"
 
+# UI 语言（新版本 config 新增字段，支持 zh_CN / en_US）
+UI_LANGUAGE="${UI_LANGUAGE:-}"
+
 # ==================== 小工具 ====================
 say() { printf '\033[1;32m[%s]\033[0m %s\n' "$(date '+%H:%M:%S')" "$*"; }
+# 强调输出：用于最终运行命令 / 访问地址等需要醒目的信息（亮青色加粗）
+emph() { printf '\033[1;36m[%s] %s\033[0m\n' "$(date '+%H:%M:%S')" "$*"; }
 warn() { printf '\033[1;33m[%s] WARN: %s\033[0m\n' "$(date '+%H:%M:%S')" "$*"; }
 die() { printf '\033[1;31m[%s] ERROR: %s\033[0m\n' "$(date '+%H:%M:%S')" "$*" >&2; exit 1; }
 section() { printf '\n\033[1;36m================ %s ================\033[0m\n' "$*"; }
@@ -66,36 +68,13 @@ extract_fname() {
 }
 
 devkitai_fname="${DEVKITAI_FNAME:-$(extract_fname "${DEVKITAI_URL}")}"
-skills_fname="${SKILLS_FNAME:-$(extract_fname "${SKILLS_URL}")}"
 tui_fname="${TUI_FNAME:-$(extract_fname "${TUI_URL}")}"
 
 # 增强型查找：宽松递归查找 devkitai 可执行文件
+# 优先级：当前激活的 INSTALL_DIR（自定义 base 后可能不再位于 ~/devkitai）优先；
+#         后续为历史部署兼容回退，仅在 INSTALL_DIR 下未找到时才使用。
 find_devkitai_bin() {
-  # 0. 优先检测指定的具体绝对路径（历史部署兼容）
-  local exact_path="${HOME}/devkitai/DevKit-AI-26.2.RC1-Linux-Kunpeng/devkitai"
-  if [ -x "${exact_path}" ]; then
-    echo "${exact_path}"
-    return 0
-  fi
-
-  local exact_path="${HOME}/devkitai/DevKit-AI-26.2.T103-Linux-Kunpeng/devkitai"
-  if [ -x "${exact_path}" ]; then
-    echo "${exact_path}"
-    return 0
-  fi
-
-  # 0.5 增加：递归查找 ${HOME}/devkitai/ 目录下的 devkitai 可执行文件
-  local home_dir="${HOME}/devkitai"
-  if [ -d "${home_dir}" ]; then
-    local home_hit
-    home_hit="$(find "${home_dir}" -type f -name devkitai -perm -111 2>/dev/null | head -n 1)"
-    if [ -n "${home_hit}" ]; then
-      echo "${home_hit}"
-      return 0
-    fi
-  fi
-
-  # 1. 直接检查安装根目录
+  # 1. 直接检查安装根目录（INSTALL_DIR 优先，随自定义 base 变化）
   if [ -x "${INSTALL_DIR}/devkitai" ]; then
     echo "${INSTALL_DIR}/devkitai"
     return 0
@@ -119,7 +98,29 @@ find_devkitai_bin() {
     return 0
   fi
 
-  # 4. 兜底检查当前用户 home 下默认位置
+  # 4. 历史部署兼容回退：~/devkitai 下的历史版本安装、递归与兜底
+  local exact_path="${HOME}/devkitai/DevKit-AI-26.2.RC1-Linux-Kunpeng/devkitai"
+  if [ -x "${exact_path}" ]; then
+    echo "${exact_path}"
+    return 0
+  fi
+
+  local exact_path="${HOME}/devkitai/DevKit-AI-26.2.T103-Linux-Kunpeng/devkitai"
+  if [ -x "${exact_path}" ]; then
+    echo "${exact_path}"
+    return 0
+  fi
+
+  local home_dir="${HOME}/devkitai"
+  if [ -d "${home_dir}" ]; then
+    local home_hit
+    home_hit="$(find "${home_dir}" -type f -name devkitai -perm -111 2>/dev/null | head -n 1)"
+    if [ -n "${home_hit}" ]; then
+      echo "${home_hit}"
+      return 0
+    fi
+  fi
+
   if [ -x "${HOME}/devkitai/devkitai" ]; then
     echo "${HOME}/devkitai/devkitai"
     return 0
@@ -163,6 +164,15 @@ read_config_port() {
   cfg="$(find_config_yaml 2>/dev/null || true)"
   if [ -n "${cfg}" ] && [ -f "${cfg}" ]; then
     sed -n '/^server:/,/^[^ #]/p' "${cfg}" | grep -m1 -E '^\s+port: ' | awk '{print $2}' | tr -d '"'
+  fi
+}
+
+# 读取 config.yaml 中 server.host（无则输出空）
+read_config_host() {
+  local cfg
+  cfg="$(find_config_yaml 2>/dev/null || true)"
+  if [ -n "${cfg}" ] && [ -f "${cfg}" ]; then
+    sed -n '/^server:/,/^[^ #]/p' "${cfg}" | grep -m1 -E '^\s+host: ' | awk '{print $2}' | tr -d '"'
   fi
 }
 
@@ -244,6 +254,79 @@ check_dir_writable() {
   rm -f "${testf}"
 }
 
+# 设置安装路径相关变量（用户输入的为 base 目录；安装到 $base/devkitai，下载/配置到 $base/.devkitai）
+set_install_path() {
+  local p="$1"
+  p="${p%/}"
+  [ -n "${p}" ] || p="${HOME}"
+  INSTALL_DIR="${p}/devkitai"
+  DOWN_DIR="${p}/.devkitai/downloads"
+}
+
+# 定位安装路径标记：固定位置 ${HOME}/.devkitai/install_base 优先，兼容旧的随 base 存放标记
+find_install_tag() {
+  if [ -f "${HOME}/.devkitai/install_base" ]; then
+    echo "${HOME}/.devkitai/install_base"
+    return 0
+  fi
+  local hit
+  hit="$(find "${HOME}" -maxdepth 4 -type f -name install_base 2>/dev/null | head -n 1)"
+  if [ -n "${hit}" ]; then
+    echo "${hit}"
+    return 0
+  fi
+  return 1
+}
+
+# 持久化 base 目录标记到固定位置 ${HOME}/.devkitai/install_base（删除该文件可重新触发询问）
+persist_install_path() {
+  mkdir -p "${HOME}/.devkitai" 2>/dev/null || true
+  printf '%s\n' "$(dirname "${INSTALL_DIR}")" > "${HOME}/.devkitai/install_base" 2>/dev/null || true
+}
+
+# 首次运行 all 时询问 base 目录并持久化：已持久化→沿用；无 tty→用默认；回车→用默认
+resolve_install_path() {
+  # 1) 已有持久化标记则沿用其路径（无论 base 自定义为何处，都能找回），并迁移到固定位置
+  local tag custom
+  if tag="$(find_install_tag)"; then
+    custom="$(cat "${tag}" 2>/dev/null || true)"
+    [ -n "${custom}" ] && set_install_path "${custom}"
+    persist_install_path
+    return 0
+  fi
+
+  # 2) 非交互环境（无 tty）不询问，采用默认路径并持久化
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    persist_install_path
+    return 0
+  fi
+
+  # 3) 交互询问（回车使用默认 base）
+  local base ans
+  base="$(dirname "${INSTALL_DIR}")"
+  printf 'Enter a directory to store devkitai (install → %s/devkitai, downloads → %s/.devkitai) [%s]: ' "${base}" "${base}" "${base}"
+  if read -r ans </dev/tty 2>/dev/null; then
+    ans="${ans// /}"
+    case "${ans}" in
+      \~/*) ans="${HOME}${ans#\~}" ;;
+      \~)   ans="${HOME}" ;;
+    esac
+    [ -n "${ans}" ] && set_install_path "${ans}"
+  fi
+  printf '\n'
+  persist_install_path
+}
+
+# 仅读取持久化标记定位安装路径（不询问）；供 start/stop/restart/uninstall 使用
+load_install_path() {
+  local tag custom
+  if tag="$(find_install_tag)"; then
+    custom="$(cat "${tag}" 2>/dev/null || true)"
+    [ -n "${custom}" ] && set_install_path "${custom}"
+  fi
+  return 0
+}
+
 # 检测当前用户是否具备安装 git 的系统级权限（root / 安装了 sudo 可尝试）。
 # 返回 0 表示可尝试安装；返回 1 表示无任何安装途径，调用方应跳过 git 安装步骤。
 have_pkg_permission() {
@@ -253,6 +336,26 @@ have_pkg_permission() {
 }
 
 # ==================== 下载 ====================
+# 在指定目录查找已存在的安装包（忽略版本号），输出完整路径；无则输出空。
+# 兼容 DevKit-AI-* 与 kunpeng-devkit-ai-* 两种命名，并排除 TUI 包混入后端匹配。
+find_pkg_file() {
+  local kind="$1" dir="$2"
+  case "${kind}" in
+    devkitai)
+      find "${dir}" -maxdepth 1 -type f \
+        \( \( -name 'DevKit-AI-*.tar.gz' ! -name 'DevKit-AI-TUI-*' \) \
+           -o \( -name 'kunpeng-devkit-ai-*.tar.gz' ! -name 'kunpeng-devkit-ai-tui-*' \) \) \
+        2>/dev/null | head -n 1
+      ;;
+    tui)
+      find "${dir}" -maxdepth 1 -type f \
+        \( -name 'kunpeng-devkit-ai-tui-*linux-arm64.tar.gz' -o -name 'DevKit-AI-TUI-*.tar.gz' \) \
+        2>/dev/null | head -n 1
+      ;;
+    *) echo "" ;;
+  esac
+}
+
 download() {
   for _caf in "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem" "/etc/ssl/certs/ca-certificates.crt"; do
     if [ -f "${_caf}" ]; then
@@ -264,9 +367,14 @@ download() {
   local url="$1" dest="$2" tmp
   tmp="${dest}.part"
   if [ -s "${dest}" ]; then say "${dest##*/} already exists, skipping download"; return 0; fi
-  say "Downloading: ${url##*/}"
   mkdir -p "$(dirname "${dest}")"
-  curl -fSLk --retry 3 --connect-timeout 15 -o "${tmp}" "${url}" || die "Download failed: ${url##*/}"
+  # stderr 保持直连终端：curl 的下载进度条与具体错误信息正常显示，不吞掉
+  if ! curl -fSLk --retry 3 --connect-timeout 15 -o "${tmp}" "${url}"; then
+    local curl_rc=$?
+    warn "Download failed: ${url##*/} (curl exit code ${curl_rc}); see the curl error message above"
+    warn "To install offline, place the packages into ${DOWN_DIR} and rerun: bash ./devkitai-setup.sh all"
+    return 1
+  fi
   [ -s "${tmp}" ] || die "Downloaded an empty file: ${url##*/}"
   mv "${tmp}" "${dest}"
 }
@@ -286,104 +394,49 @@ get_pkg() {
   esac
 }
 
-# 自动解析 TUI 安装包直链：
-#   1. 若显式设置了 TUI_URL，直接使用；
-#   2. 否则查询 GitCode releases API，取最新匹配 linux-arm64 的安装包；
-#   3. 均失败时按 TUI_VERSION 构造兜底直链。
-resolve_tui_url() {
-  if [ -n "${TUI_URL}" ]; then
-    echo "${TUI_URL}"
-    return 0
-  fi
-
-  local api_url json_file py resolved fallback_url
-  api_url="https://gitcode.com/api/v5/repos/${TUI_REPO}/releases"
-  json_file="$(mktemp)"
-  if curl -fsSLk --retry 2 --connect-timeout 15 -o "${json_file}" "${api_url}" 2>/dev/null; then
-    py="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || echo none)"
-    resolved=""
-    if [ "${py}" != "none" ]; then
-      resolved="$(PY_TUI_FILE="${json_file}" TUI_VERSION="${TUI_VERSION}" "${py}" - <<'PYEOF' 2>/dev/null || true
-import json, os, sys
-try:
-    data = json.load(open(os.environ["PY_TUI_FILE"], encoding="utf-8"))
-except Exception:
-    sys.exit(1)
-want = os.environ.get("TUI_VERSION", "")
-for rel in data:
-    tag = rel.get("tag_name", "") or ""
-    for asset in rel.get("assets", []) or []:
-        name = asset.get("name", "") or ""
-        url = asset.get("browser_download_url", "") or ""
-        if name.startswith("kunpeng-devkit-ai-tui-") and "linux-arm64.tar.gz" in name:
-            if want and want not in tag and want not in name:
-                continue
-            print(url)
-            sys.exit(0)
-sys.exit(1)
-PYEOF
-)"
-    else
-      resolved="$(grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*kunpeng-devkit-ai-tui-[^"]*linux-arm64\.tar\.gz"' "${json_file}" 2>/dev/null | sed -E 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' | head -n 1 || true)"
-    fi
-    rm -f "${json_file}"
-    if [ -n "${resolved}" ]; then
-      say "Resolved TUI package via GitCode releases API: ${resolved##*/}" >&2
-      echo "${resolved}"
-      return 0
-    fi
-  else
-    rm -f "${json_file}"
-  fi
-
-  fallback_url="https://gitcode.com/${TUI_REPO}/releases/download/v${TUI_VERSION}/kunpeng-devkit-ai-tui-${TUI_VERSION}-linux-arm64.tar.gz"
-  warn "Unable to auto-resolve the TUI direct link; will use the v${TUI_VERSION} package (set the TUI_URL environment variable to specify a direct link if this fails)" >&2
-  echo "${fallback_url}"
-}
-
 cmd_download() {
+  resolve_install_path
   [ -n "${DEVKITAI_URL}" ] || die "DEVKITAI_URL is not set"
   check_dir_writable "${DOWN_DIR}" "download"
+
+  local dl_ok=1
 
   section "Downloading packages (saved to ${DOWN_DIR})"
 
   if [ -n "${DEVKITAI_URL}" ]; then
     devkitai_fname="${DEVKITAI_FNAME:-$(extract_fname "${DEVKITAI_URL}")}"
     say "----- devkitai backend -----"
-    get_pkg "${DEVKITAI_URL}" "${DOWN_DIR}/${devkitai_fname}"
-  fi
-
-  if [ -n "${SKILLS_URL}" ]; then
-    skills_fname="${SKILLS_FNAME:-$(extract_fname "${SKILLS_URL}")}"
-    say "----- skills package -----"
-    get_pkg "${SKILLS_URL}" "${DOWN_DIR}/${skills_fname}"
+    # 忽略版本号：downloads 目录已有任意版本 DevKit-AI 包则直接用，避免离线时误触发下载
+    if [ ! -s "${DOWN_DIR}/${devkitai_fname}" ]; then
+      local found_dev
+      found_dev="$(find_pkg_file devkitai "${DOWN_DIR}")"
+      if [ -n "${found_dev}" ]; then
+        devkitai_fname="$(basename "${found_dev}")"
+        say "Found existing package (any version): ${devkitai_fname}"
+      fi
+    fi
+    get_pkg "${DEVKITAI_URL}" "${DOWN_DIR}/${devkitai_fname}" || dl_ok=0
   fi
 
   # --- DevKit AI TUI ---
-  # 先按既定命名规则推导预期文件名，若包已存在于下载目录则直接跳过解析与下载
-  local tui_url tui_pkg
-  if [ -n "${TUI_FNAME}" ]; then
-    tui_pkg="${DOWN_DIR}/${TUI_FNAME}"
-  elif [ -n "${TUI_URL}" ]; then
-    tui_pkg="${DOWN_DIR}/$(extract_fname "${TUI_URL}")"
-  else
-    tui_pkg="${DOWN_DIR}/kunpeng-devkit-ai-tui-${TUI_VERSION}-linux-arm64.tar.gz"
-  fi
-  tui_fname="${tui_pkg##*/}"
-
-  if [ -s "${tui_pkg}" ]; then
+  if [ -n "${TUI_URL}" ]; then
+    tui_fname="${TUI_FNAME:-$(extract_fname "${TUI_URL}")}"
     say "----- DevKit AI TUI -----"
-    say "${tui_fname} already exists in ${DOWN_DIR}, skipping download"
-  else
-    tui_url="$(resolve_tui_url)"
-    if [ -n "${tui_url}" ]; then
-      tui_fname="${TUI_FNAME:-$(extract_fname "${tui_url}")}"
-      say "----- DevKit AI TUI -----"
-      get_pkg "${tui_url}" "${DOWN_DIR}/${tui_fname}"
+    # 忽略版本号：downloads 目录已有任意版本 TUI 包则直接用，避免离线时误触发下载
+    if [ ! -s "${DOWN_DIR}/${tui_fname}" ]; then
+      local found_tui
+      found_tui="$(find_pkg_file tui "${DOWN_DIR}")"
+      if [ -n "${found_tui}" ]; then
+        tui_fname="$(basename "${found_tui}")"
+        say "Found existing TUI package (any version): ${tui_fname}"
+      fi
     fi
+    get_pkg "${TUI_URL}" "${DOWN_DIR}/${tui_fname}" || dl_ok=0
   fi
 
-  say "Download complete, package directory: ${DOWN_DIR}"
+  if [ "${dl_ok}" = "1" ]; then
+    say "Download complete, package directory: ${DOWN_DIR}"
+  fi
 }
 
 # ==================== 安装 ====================
@@ -391,7 +444,6 @@ cmd_install() {
   local devkit_bin
   devkit_bin="$(find_devkitai_bin 2>/dev/null || true)"
   check_dir_writable "${INSTALL_DIR}" "install"
-  check_dir_writable "${PUSH_DIR}" "skills"
 
   section "Installing devkitai"
   if [ -n "${devkit_bin}" ] && [ -x "${devkit_bin}" ]; then
@@ -402,33 +454,30 @@ cmd_install() {
       mkdir -p "${INSTALL_DIR}"
       tar -xzf "${DOWN_DIR}/${devkitai_fname}" -C "${INSTALL_DIR}"
     else
-      die "Missing package ${devkitai_fname}; run download first or check ${DOWN_DIR}"
+      # 忽略版本号：downloads 目录已有任意版本 DevKit-AI 包则用之，保证离线包版本与 URL 不同也能安装
+      local found_dev
+      found_dev="$(find_pkg_file devkitai "${DOWN_DIR}")"
+      if [ -n "${found_dev}" ]; then
+        devkitai_fname="$(basename "${found_dev}")"
+        say "Extracting ${devkitai_fname} (any version) → ${INSTALL_DIR}"
+        mkdir -p "${INSTALL_DIR}"
+        tar -xzf "${found_dev}" -C "${INSTALL_DIR}"
+      else
+        die "Missing devkitai package in ${DOWN_DIR}; place a DevKit-AI package there first, then rerun: bash ./devkitai-setup.sh all"
+      fi
     fi
     devkit_bin="$(find_devkitai_bin 2>/dev/null || true)"
   fi
   [ -n "${devkit_bin}" ] && [ -x "${devkit_bin}" ] || die "devkitai executable not found; check ${INSTALL_DIR} and the downloaded package"
   say "devkitai executable: ${devkit_bin}"
 
-  section "Placing skills package"
-  if [ -n "${skills_fname}" ] && [ -s "${DOWN_DIR}/${skills_fname}" ]; then
-    if [ -s "${PUSH_DIR}/${skills_fname}" ]; then
-      say "${PUSH_DIR}/${skills_fname} already exists, skipping"
-    else
-      say "Placing ${skills_fname} → ${PUSH_DIR}/"
-      mkdir -p "${PUSH_DIR}"
-      cp -f "${DOWN_DIR}/${skills_fname}" "${PUSH_DIR}/"
-    fi
-  else
-    say "No skills package configured (SKILLS_URL is empty), skipping"
-  fi
-
   section "Installing DevKit AI TUI"
   local tui_installed="false"
 
-  # 若 tui_fname 为空，尝试从下载目录扫描，或重新解析 URL
-  if [ -z "${tui_fname}" ]; then
+  # 忽略版本号：URL 精确名不存在时（离线包版本不同），从下载目录扫描任意版本 TUI 包
+  if [ -z "${tui_fname}" ] || [ ! -s "${DOWN_DIR}/${tui_fname}" ]; then
     local hit
-    hit="$(find "${DOWN_DIR}" -maxdepth 1 -type f -name 'kunpeng-devkit-ai-tui-*linux-arm64.tar.gz' 2>/dev/null | head -n 1)"
+    hit="$(find_pkg_file tui "${DOWN_DIR}")"
     if [ -n "${hit}" ]; then
       tui_fname="$(basename "${hit}")"
       say "TUI package recognized from download directory: ${tui_fname}"
@@ -481,13 +530,23 @@ cmd_install() {
   fi
 
   section "Installation complete"
-  say "devkitai / skills / TUI are ready; run ./devkitai-setup.sh config to configure"
+  say "devkitai / skills / TUI are ready"
+  say "Now configuring the chat model below; press Enter to keep the value in brackets"
 }
 
 # ==================== 配置 config.yaml ====================
 ask_val() {
-  local desc="$1" var="$2" cur="$3" input="" ch stty_g
-  printf '    %-20s [%s]: ' "${desc}" "${cur}"
+  local desc="$1" var="$2" cur="$3" mask="${4:-0}" opts="${5:-}" input="" ch stty_g disp
+  disp="${cur}"
+  # 掩码模式（第 4 参非 0，如 api_key）：仅展示尾 4 位 + ****，避免明文暴露
+  if [ "${mask}" != "0" ] && [ -n "${cur}" ]; then
+    if [ "${#cur}" -gt 4 ]; then
+      disp="****${cur: -4}"
+    else
+      disp="****"
+    fi
+  fi
+  printf '    %-20s %s[%s]: ' "${desc}" "${opts:+(options: ${opts}) }" "${disp}"
   stty_g="$(stty -F /dev/tty -g 2>/dev/null || true)"
   if [ -n "${stty_g}" ]; then
     stty -F /dev/tty -icanon -echo min 1 time 0 2>/dev/null || true
@@ -541,9 +600,64 @@ ask_val() {
   [ -n "${stty_g}" ] && stty -F /dev/tty "${stty_g}" 2>/dev/null || true
   # 字段为空时保留默认值；必须返回 0，否则 set -e 会在用户直接回车时中断整个脚本
   if [ -n "${input}" ]; then
-    eval "${var}='${input}'"
+    printf -v "${var}" '%s' "${input}"
   fi
   return 0
+}
+
+# 交互配置新版本 config 的 UI 语言（zh_CN / en_US；非法值回落 zh_CN）
+ask_language_config() {
+  local py cur_lang=""
+  py="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || echo none)"
+  if [ "${py}" != "none" ]; then
+    cur_lang="$("${py}" - <<'PYX'
+import re, os
+cfg = os.environ.get("CONFIG_YAML", "")
+if cfg:
+    for l in open(cfg, encoding="utf-8").read().splitlines():
+        if l.startswith("language:"):
+            v = l.split(":", 1)[1].strip().strip('"').strip("'")
+            if v:
+                print(v)
+                break
+PYX
+)"
+  fi
+
+  UI_LANGUAGE="${UI_LANGUAGE:-${cur_lang:-zh_CN}}"
+  UI_LANGUAGE="$(printf '%s' "${UI_LANGUAGE}" | tr -d ' ')"
+  ask_val "language" UI_LANGUAGE "${UI_LANGUAGE}" 0 "zh_CN / en_US"
+  UI_LANGUAGE="$(printf '%s' "${UI_LANGUAGE}" | tr -d ' ')"
+  local upper
+  upper="$(printf '%s' "${UI_LANGUAGE}" | tr '[:lower:]' '[:upper:]')"
+  case "${upper}" in
+    ZH_CN) UI_LANGUAGE="zh_CN" ;;
+    EN_US) UI_LANGUAGE="en_US" ;;
+    *) warn "Unsupported language '${UI_LANGUAGE}'; supported: zh_CN / en_US, falling back to zh_CN"; UI_LANGUAGE="zh_CN" ;;
+  esac
+  export UI_LANGUAGE
+}
+
+# 调用 ./devkitai encrypt 子命令交互加密 api_key，返回密文（只打印密文本身）
+# encrypt 为交互式：脚本运行它时用户输入明文，其输出含“加密后的密文： <密文>”
+encrypt_api_key() {
+  local devkit_bin out_file cipher
+  devkit_bin="$(find_devkitai_bin 2>/dev/null || true)"
+  [ -n "${devkit_bin}" ] && [ -x "${devkit_bin}" ] || die "devkitai executable not found; cannot run encrypt"
+
+  # 提示走 stderr；encrypt 交互输出回显给用户（stderr）同时写临时文件；
+  # 关键：函数 stdout 只输出最终密文（否则被外层命令替换 $(...) 混入无关内容）
+  say "Running: ${devkit_bin} encrypt" >&2
+  say "Please enter the plain text to encrypt at the prompt below" >&2
+  out_file="$(mktemp)"
+  "${devkit_bin}" encrypt 2>&1 | tee "${out_file}" >&2 || true
+  # 解析：仅匹配“加密后的密文：”后紧跟的 base64 密文 token（A-Za-z0-9+/=），取首个结果。
+  # 明确锚定该前缀，避免 say 提示行中的路径/拼写等杂串被误提取。
+  cipher="$(grep -oE '加密后的密文：[[:space:]]*[A-Za-z0-9+/=]+' "${out_file}" \
+            | sed 's/加密后的密文：[[:space:]]*//' | head -n 1)"
+  rm -f "${out_file}"
+  [ -n "${cipher}" ] || die "Failed to parse the encrypted api_key from './devkitai encrypt' output"
+  printf '%s' "${cipher}"
 }
 
 ask_chat_config() {
@@ -566,7 +680,7 @@ if os.path.exists(cfg_path):
     with open(cfg_path, encoding="utf-8") as f:
         for line in f:
             l_str = line.strip()
-            if l_str == "chat_models:":
+            if re.match(r'^chat_models:\s*(#.*)?$', l_str):
                 in_chat = True
                 continue
             if not in_chat:
@@ -597,24 +711,34 @@ PYX
 
   # 2. model_provider 默认值
   CHAT_MODEL_PROVIDER="${CHAT_MODEL_PROVIDER:-${cur_provider}}"
-  CHAT_MODEL_PROVIDER="${CHAT_MODEL_PROVIDER:-deepseek}"
+  CHAT_MODEL_PROVIDER="${CHAT_MODEL_PROVIDER:-openai}"
 
   # 3. base_url 默认值
   CHAT_BASE_URL="${CHAT_BASE_URL:-${cur_base}}"
   CHAT_BASE_URL="${CHAT_BASE_URL:-https://api.deepseek.com}"
 
-  # 4. api_key：优先环境变量，其次读取现有配置；均无则留空由用户输入（空则保留 config 原 key）
-  CHAT_API_KEY_PLAIN="${CHAT_API_KEY_PLAIN:-${cur_key}}"
-
   ask_val "model"          CHAT_MODEL_ID "${CHAT_MODEL_ID}"
   ask_val "model_provider" CHAT_MODEL_PROVIDER "${CHAT_MODEL_PROVIDER}"
   ask_val "base_url"       CHAT_BASE_URL "${CHAT_BASE_URL}"
-  ask_val "api_key"        CHAT_API_KEY_PLAIN "${CHAT_API_KEY_PLAIN}"
+
+  # 4. api_key：新版要求先经 ./devkitai encrypt 加密成密文，才能写入 config.yaml 的 api_key 字段。
+  #    已有密文则回车保留，输入 y 重新加密；未设置时直接调用 encrypt 子命令交互加密。
+  local key_choice=""
+  CHAT_API_KEY_ENC="${CHAT_API_KEY_ENC:-${cur_key}}"
+  if [ -n "${CHAT_API_KEY_ENC}" ]; then
+    printf '    %-20s [****%s] (Enter to keep / y to re-encrypt): ' "api_key" "${CHAT_API_KEY_ENC: -4}"
+  else
+    printf '    %-20s [not set] (Press Enter to call ./devkitai encrypt): ' "api_key"
+  fi
+  IFS= read -r key_choice </dev/tty || true
+  key_choice="$(printf '%s' "${key_choice}" | tr -d ' ' | tr '[:upper:]' '[:lower:]')"
+  if [ -z "${CHAT_API_KEY_ENC}" ] || [ "${key_choice}" = "y" ]; then
+    CHAT_API_KEY_ENC="$(encrypt_api_key)"
+  fi
+  export CHAT_API_KEY_ENC
+
   # name 直接沿用 model 的值
   CHAT_MODEL_NAME="${CHAT_MODEL_ID}"
-  if [ -z "${CHAT_API_KEY_PLAIN}" ]; then
-    say "Note: no new api_key provided; the chat_models record keeps its original api_key"
-  fi
 }
 
 ask_context_config() {
@@ -647,6 +771,48 @@ PYX
   ask_val "max_context_tokens" MAX_CONTEXT_TOKENS "${MAX_CONTEXT_TOKENS}"
 }
 
+# 多 IP 时交互选择一个作为 server 绑定 IP；HOST_BIND 环境变量显式指定则跳过选择
+choose_host_bind() {
+  [ -n "${HOST_BIND_ENV}" ] && return 0
+  local ip_all ip_list
+  ip_all="$(hostname -I 2>/dev/null)" || true
+  ip_list="$(printf '%s\n' "${ip_all}" | tr ' ' '\n' | sed '/^[[:space:]]*$/d')"
+  [ -n "${ip_list}" ] || return 0
+  local count
+  count="$(printf '%s\n' "${ip_list}" | sed '/^$/d' | wc -l | tr -d ' ')"
+  [ "${count}" -gt 1 ] || return 0
+
+  printf '\n  Detected multiple IPs; choose the one for the devkitai server to bind:\n'
+  local i sel=""
+  i=1
+  while IFS= read -r ip; do
+    printf '  %s) %s\n' "${i}" "${ip}"
+    i=$((i+1))
+  done <<< "${ip_list}"
+
+  printf '  Your choice [1]: '
+  read -r sel
+  sel="${sel:-1}"
+  if ! printf '%s\n' "${sel}" | grep -qE '^[0-9]+$' || [ "${sel}" -lt 1 ] || [ "${sel}" -gt "${count}" ]; then
+    warn "Invalid choice (1-${count}); keep ${HOST_BIND}"
+    return 0
+  fi
+  HOST_BIND="$(printf '%s\n' "${ip_list}" | sed -n "${sel}p")"
+  [ -n "${HOST_BIND}" ] || HOST_BIND="${IFACE_IP}"
+  say "devkitai server will bind to ${HOST_BIND}"
+}
+
+# 解析最终绑定 IP：显式环境变量 > config.yaml 已配置 host > 第一个网卡 IP
+resolve_bind_host() {
+  if [ -n "${HOST_BIND_ENV}" ]; then
+    printf '%s' "${HOST_BIND_ENV}"
+  else
+    local cfg_host
+    cfg_host="$(read_config_host 2>/dev/null || true)"
+    printf '%s' "${cfg_host:-${HOST_BIND}}"
+  fi
+}
+
 ask_server_config() {
   local py cur_port=""
   py="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || echo none)"
@@ -677,6 +843,7 @@ PYX
   fi
 
   HOST_BIND="${HOST_BIND:-${IFACE_IP}}"
+  choose_host_bind
   local free_port
   free_port="$(find_free_port "${cur_port:-8125}")"
   DEVKITAI_SERVICE_PORT="${DEVKITAI_SERVICE_PORT:-${free_port}}"
@@ -684,6 +851,7 @@ PYX
 }
 
 cmd_config() {
+  export CONFIG_YAML
   CONFIG_YAML="$(find_config_yaml || true)"
   [ -n "${CONFIG_YAML}" ] && [ -f "${CONFIG_YAML}" ] || die "Original config.yaml not found; check whether devkitai has been extracted in ${INSTALL_DIR}"
 
@@ -706,13 +874,14 @@ cmd_config() {
   fi
 
   while true; do
+  ask_language_config
   ask_chat_config
   ask_context_config
 
   # 2) 基于原文件做字段级修改（每次：chat 模型 + 上下文；首次额外修正一次性字段）
   export CHAT_MODEL_NAME="${CHAT_MODEL_NAME}" CHAT_MODEL_PROVIDER="${CHAT_MODEL_PROVIDER}" \
          CHAT_MODEL_ID="${CHAT_MODEL_ID}" CHAT_BASE_URL="${CHAT_BASE_URL}" \
-         CHAT_API_KEY_PLAIN="${CHAT_API_KEY_PLAIN}" \
+         CHAT_API_KEY_ENC="${CHAT_API_KEY_ENC}" \
          MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS}" \
          HOST_VAL="${HOST_BIND}" PORT_VAL="${DEVKITAI_SERVICE_PORT}" ROOT_VAL="${INSTALL_DIR}/skills"
 
@@ -723,35 +892,73 @@ max_tokens = os.environ.get("MAX_CONTEXT_TOKENS", "1000000")
 need = {k: v for k, v in {
     "name": os.environ.get("CHAT_MODEL_NAME", "deepseek-flash"),
     "model": os.environ.get("CHAT_MODEL_ID", "deepseek-flash"),
-    "model_provider": os.environ.get("CHAT_MODEL_PROVIDER", "deepseek"),
+    "model_provider": os.environ.get("CHAT_MODEL_PROVIDER", "openai"),
     "base_url": os.environ.get("CHAT_BASE_URL", "https://api.deepseek.com"),
-    "api_key": os.environ.get("CHAT_API_KEY_PLAIN", ""),
+    "api_key": os.environ.get("CHAT_API_KEY_ENC", ""),
 }.items() if v}
 
 lines = open(src, encoding="utf-8").read().splitlines()
 
-# b) chat_models 首条记录字段更新
+# b) chat_models 模型记录更新 / 补充（新版 config 可能只剩注释模板，无实际记录）
 if need:
-    in_chat, record = False, 0
+    cm_idx, in_chat, record = None, False, 0
     for i, l in enumerate(lines):
-        s = l.strip()
-        if l == "chat_models:":
-            in_chat = True
+        if re.match(r'^chat_models:\s*(#.*)?$', l):
+            in_chat, cm_idx = True, i
             continue
         if not in_chat:
             continue
+        s = l.strip()
         if s.startswith("#") or not s:
             continue
         if not l.startswith((" ", "\t", "-")):
             break
         if l.startswith("-"):
             record += 1
-        if record > 1:
-            break
-        m = re.search(r'(name|model|model_provider|base_url|api_key):\s*(.*?)\s*$', l)
-        if m and m.group(1) in need:
-            prefix = l[:l.find(m.group(1))]
-            lines[i] = '%s%s: "%s"' % (prefix, m.group(1), need[m.group(1)])
+    # b1) 文件无 chat_models 顶层键：末尾追加
+    if cm_idx is None:
+        new_rec = [
+            '  - name: "%s"' % need.get("name", ""),
+            '    model: "%s"' % need.get("model", ""),
+            '    model_provider: "%s"' % need.get("model_provider", ""),
+            '    base_url: "%s"' % need.get("base_url", ""),
+            '    api_key: "%s"' % need.get("api_key", ""),
+            '    enable_thinking: true',
+        ]
+        lines.extend(["", "chat_models:"] + new_rec)
+    # b2) 新版无实际记录：在 chat_models 下补充一条（旧版默认字段）
+    elif record == 0:
+        new_rec = [
+            '- name: "%s"' % need.get("name", ""),
+            '  model: "%s"' % need.get("model", ""),
+            '  model_provider: "%s"' % need.get("model_provider", ""),
+            '  base_url: "%s"' % need.get("base_url", ""),
+            '  api_key: "%s"' % need.get("api_key", ""),
+            '  enable_thinking: true',
+        ]
+        lines = lines[:cm_idx + 1] + new_rec + lines[cm_idx + 1:]
+    else:
+        # b3) 已有记录：更新首条记录的字段值
+        in_chat, record = False, 0
+        for i, l in enumerate(lines):
+            s = l.strip()
+            if re.match(r'^chat_models:\s*(#.*)?$', l):
+                in_chat = True
+                continue
+            if not in_chat:
+                continue
+            if s.startswith("#") or not s:
+                continue
+            if not l.startswith((" ", "\t", "-")):
+                break
+            if l.startswith("-"):
+                record += 1
+            if record > 1:
+                break
+            m = re.search(r'(name|model|model_provider|base_url|api_key):\s*(.*?)\s*$', l)
+            if m and m.group(1) in need:
+                prefix = l[:l.find(m.group(1))]
+                lines[i] = '%s%s: "%s"' % (prefix, m.group(1), need[m.group(1)])
 
 # e) set_context.max_context_tokens 修改或追加
 in_ctx, ctx_start, ctx_end = False, -1, len(lines)
@@ -779,6 +986,27 @@ else:
     lines.append("set_context:")
     lines.append('  max_context_tokens: %s' % max_tokens)
 
+# f) language 顶层字段写入（新版新增；存在则替换，缺失则在第一个顶层键前插入）
+lang = os.environ.get("UI_LANGUAGE", "")
+if lang:
+    li = None
+    for i, l in enumerate(lines):
+        if re.match(r'^language:\s*', l.strip()):
+            li = i
+            break
+    if li is not None:
+        lines[li] = 'language: %s' % lang
+    else:
+        top = None
+        for i, l in enumerate(lines):
+            if l.strip() and not l.strip().startswith("#") and not l.startswith((" ", "\t")):
+                top = i
+                break
+        if top is not None:
+            lines.insert(top, 'language: %s' % lang)
+        else:
+            lines.append('language: %s' % lang)
+
 open(dst, "w", encoding="utf-8").write("\n".join(lines) + "\n")
 PYEOF
   [ "$?" -eq 0 ] || die "Failed to modify based on the original config (model/context)"
@@ -793,6 +1021,57 @@ port = os.environ.get("PORT_VAL", "")
 root_dir = os.environ.get("ROOT_VAL", "")
 
 lines = open(src, encoding="utf-8").read().splitlines()
+
+# g) 新版 config 缺失的顶层字段补入（remote_skills / downloader / backend 来自旧版模板，
+#    保证 skills 下载/加载逻辑不变；随后 c/c2/d/f 逻辑会把这些字段修正为脚本设定值）
+def ensure_block(block):
+    key = block.split(":", 1)[0]
+    for l in lines:
+        if l.strip() == key + ":":
+            return
+    lines.append("")
+    lines.extend(block.rstrip("\n").splitlines())
+
+ensure_block("""remote_skills:
+    # embedding_model: "bge-m3:latest"  # skill embedding model
+    load_child_skills: false  # true: 加载所有子 skill；false: 只加载顶层 skill
+    candidate_k: 20  # 两路统一召回条数（正整数）
+    weight_vector: 0.7  # 向量检索权重（0-1）
+    similarity_threshold: 0.45 # 意图召回相似度阈值（0-1），阈值越高，意图识别越精确
+    skills:
+      - name: DevkitAI
+        version: "1.0.0"
+        url: "https://raw.gitcode.com/openeuler/kunpeng-devkit/archive/refs/heads/master.zip"
+        checksum: ""  # 可留空，校验会跳过
+        channel: local  # api: http方式下载/git： git clone方式下载/local：加载本地文件目录
+        enable: true
+        force_update: false  # 是否强制下载（忽略版本检测）
+        #local_filename: "DevkitAI.zip"  # 可选：指定下载文件名，不填则从URL自动解析，local方式不需要设置
+        format: "auto"  # auto/tar.gz/zip/file/directory，如果选择auto且无法辨识具体文件包结构时，默认为directory
+""")
+ensure_block("""downloader:
+  default_timeout: 60  # 默认超时时间（秒）
+  retry_times: 2       # 重试次数
+  http:
+    ssl_verify: true           # 是否验证SSL证书（生产环境建议true）
+    chunk_size: 5242880        # 1MB - 分块大小
+    max_parallel: 3            # 最大并行下载数
+    min_file_size: 10485760    # 10MB - 大于这个才使用分块并行下载
+  git:
+    default_branch: "main"     # 默认分支
+    clone_depth: 1             # clone 深度
+  verification:
+    enable: false              # 是否启用校验 (false 则跳过所有校验，安全风险！)
+  signature:
+    enable: false             # 是否启用签名验证 (需要配套 .p7s/.sig 签名文件)
+    signature_format: "DER"    # DER 或 PEM
+    verify_chain: true         # 是否验证证书链
+    root_ca: ""                # 根证书路径
+""")
+ensure_block("""backend:
+  config:
+    root_dir: "/home/skills"  # skills根目录，local方式禁止设置url与此目录相同
+""")
 
 # a) server 节点 (host / port / protocol) 作用域定位与修改/补全
 in_server, server_start, server_end = False, -1, len(lines)
@@ -834,6 +1113,47 @@ if server_start != -1:
             break
     if not has_proto:
         server_lines.insert(0, '  protocol: "http"')
+
+    # service.mode：新版本默认 systemd，这里统一改为 normal（前台直接启动）
+    svc_idx = None
+    for idx, sl in enumerate(server_lines):
+        if re.match(r'^\s*service:\s*$', sl.strip()):
+            svc_idx = idx
+            break
+    if svc_idx is not None:
+        mode_idx = None
+        for j in range(svc_idx + 1, len(server_lines)):
+            s = server_lines[j].strip()
+            if not s or s.startswith("#"):
+                continue
+            indent = len(server_lines[j]) - len(server_lines[j].lstrip())
+            if indent <= 2:
+                break
+            if re.match(r'^\s*mode:\s*', s):
+                mode_idx = j
+                break
+        if mode_idx is not None:
+            server_lines[mode_idx] = '    mode: normal'
+        else:
+            server_lines.insert(svc_idx + 1, '    mode: normal')
+
+    # key.enable：新版默认 true 但 value 为空，服务会校验失败，这里统一改为 false（不启用鉴权）
+    key_idx = None
+    for idx, sl in enumerate(server_lines):
+        if re.match(r'^\s*key:\s*$', sl.strip()):
+            key_idx = idx
+            break
+    if key_idx is not None:
+        for j in range(key_idx + 1, len(server_lines)):
+            s = server_lines[j].strip()
+            if not s or s.startswith("#"):
+                continue
+            indent = len(server_lines[j]) - len(server_lines[j].lstrip())
+            if indent <= 2:
+                break
+            if re.match(r'^\s*enable:\s*', s):
+                server_lines[j] = '    enable: false'
+                break
 
     lines = lines[:server_start + 1] + server_lines + lines[server_end:]
 
@@ -923,7 +1243,7 @@ PYEOF
   local cfg_port
   cfg_port="$(read_config_port 2>/dev/null || true)"
   DEVKITAI_SERVICE_PORT="${DEVKITAI_SERVICE_PORT:-${cfg_port:-8125}}"
-  DEVKITAI_SERVICE_BASE_URL="http://${HOST_BIND}:${DEVKITAI_SERVICE_PORT}"
+  DEVKITAI_SERVICE_BASE_URL="http://$(resolve_bind_host):${DEVKITAI_SERVICE_PORT}"
   local rc_path
   case "${SHELL:-}" in
     *zsh*) rc_path="${HOME}/.zshrc" ;;
@@ -982,9 +1302,9 @@ install_git_home() {
   esac
   # 先删除旧块再写入，避免 bashrc 中重复
   touch "${rc_path}" 2>/dev/null || true
-  sed -i '/^# DevKit AI git (home 安装)$/,/^export PERL5LIB=/d' "${rc_path}" || true
+  sed -i '/^# DevKit AI git (home install)$/,/^export PERL5LIB=/d' "${rc_path}" || true
   {
-    printf '# DevKit AI git (home 安装)\n'
+    printf '# DevKit AI git (home install)\n'
     printf 'export PATH="%s/usr/bin:%s/usr/libexec/git-core:$PATH"\n' "${git_home}" "${git_home}"
     printf 'export GIT_TEMPLATE_DIR="%s/usr/share/git-core/templates"\n' "${git_home}"
     printf 'export PERL5LIB="%s/usr/share/perl5/vendor_perl:%s/usr/lib64/perl5/vendor_perl"\n' "${git_home}" "${git_home}"
@@ -1064,8 +1384,8 @@ ensure_git() {
   esac
   # 先删除旧行再写入，避免 bashrc 中重复
   touch "${rc_path}" 2>/dev/null || true
-  sed -i '/^# DevKit AI git 全局配置$/d; /^export GIT_CONFIG_GLOBAL=/d' "${rc_path}" || true
-  printf '# DevKit AI git 全局配置\nexport GIT_CONFIG_GLOBAL=%s\n' "${GIT_CONFIG_GLOBAL}" >> "${rc_path}"
+  sed -i '/^# DevKit AI git global config$/d; /^export GIT_CONFIG_GLOBAL=/d' "${rc_path}" || true
+  printf '# DevKit AI git global config\nexport GIT_CONFIG_GLOBAL=%s\n' "${GIT_CONFIG_GLOBAL}" >> "${rc_path}"
   say "GIT_CONFIG_GLOBAL=${GIT_CONFIG_GLOBAL} written to ${rc_path} (effective on next login)"
   git_name="$(git config --global user.name 2>/dev/null || true)"
   git_email="$(git config --global user.email 2>/dev/null || true)"
@@ -1153,7 +1473,7 @@ start_server() {
     DEVKITAI_SERVICE_PORT="$(find_free_port 8125)"
   fi
 
-  DEVKITAI_SERVICE_BASE_URL="http://${HOST_BIND}:${DEVKITAI_SERVICE_PORT}"
+  DEVKITAI_SERVICE_BASE_URL="http://$(resolve_bind_host):${DEVKITAI_SERVICE_PORT}"
 
   local bin_dir log_file pid_file
   bin_dir="$(dirname "${devkit_bin}")"
@@ -1185,7 +1505,7 @@ start_server() {
       exit 1
     fi
     if port_open; then
-      printf '    [%s/60] Port %s is now listening\n' "${i}" "${DEVKITAI_SERVICE_PORT}"
+      printf '\033[K    [%s/60] Port %s is now listening\n' "${i}" "${DEVKITAI_SERVICE_PORT}"
       break
     fi
     printf '    [%s/60] Waiting for server to be ready...\r' "${i}"
@@ -1198,7 +1518,7 @@ start_server() {
     exit 1
   fi
   printf '\n'
-  say "READY: devkitai server is up (${HOST_BIND}:${DEVKITAI_SERVICE_PORT})"
+  emph "READY: devkitai server is up ($(resolve_bind_host):${DEVKITAI_SERVICE_PORT})"
   export DEVKITAI_SERVICE_BASE_URL="${DEVKITAI_SERVICE_BASE_URL}"
 }
 
@@ -1206,25 +1526,28 @@ start_server() {
 start_tui_prompt() {
   if [ -x "${HOME}/.local/bin/devkitai-tui" ]; then
     say "TUI is installed. Start it manually:"
-    say "    source ${HOME}/.bashrc && devkitai-tui"
-    say "    or open a new terminal and run: devkitai-tui"
+    emph "    source ${HOME}/.bashrc && devkitai-tui"
+    emph "    or open a new terminal and run: devkitai-tui"
   else
-    say "Warning: ~/.local/bin/devkitai-tui does not exist; run install to install the TUI first"
+    say "Warning: ~/.local/bin/devkitai-tui does not exist (install failed or was skipped; if failed due to no space left on device, free up disk space first); re-run: bash ./devkitai-setup.sh all"
   fi
 }
 
 cmd_start() {
+  load_install_path
   start_server
   start_tui_prompt
 }
 
 cmd_stop() {
+  load_install_path
   stop_server
   say "devkitai server stopped"
 }
 
 # restart = 修改配置 + 启动（config 与 restart 合并为同一复合流程）
 cmd_restart() {
+  load_install_path
   cmd_config
   cmd_start
 }
@@ -1235,24 +1558,28 @@ cleanup_rc() {
   local rc
   for rc in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
     [ -f "${rc}" ] || continue
-    sed -i '/^# DevKit AI TUI$/d; /^export PATH="\${HOME}\/\.local\/bin:\${PATH}"$/d; /^# DevKit AI TUI backend$/d; /^export DEVKITAI_SERVICE_BASE_URL=/d; /^# DevKit AI git (home 安装)$/,/^export PERL5LIB=/d; /^# DevKit AI git 全局配置$/d; /^export GIT_CONFIG_GLOBAL=/d' "${rc}" 2>/dev/null || true
+    sed -i '/^# DevKit AI TUI$/d; /^export PATH="\${HOME}\/\.local\/bin:\${PATH}"$/d; /^# DevKit AI TUI backend$/d; /^export DEVKITAI_SERVICE_BASE_URL=/d; /^# DevKit AI git (home install)$/,/^export PERL5LIB=/d; /^# DevKit AI git global config$/d; /^export GIT_CONFIG_GLOBAL=/d' "${rc}" 2>/dev/null || true
   done
 }
 
 cmd_uninstall() {
   section "Uninstalling DevKit AI"
+  load_install_path
   stop_server
 
-  local devkit_bin
-  devkit_bin="$(find_devkitai_bin 2>/dev/null || true)"
-  if [ -n "${devkit_bin}" ]; then
-    say "Found devkitai at: ${devkit_bin}"
-  fi
-
   # 1) 询问是否删除数据目录（默认保留；UNINSTALL_KEEP_DATA=1 跳过询问并保留）
-  local keep_data="true" ans
-  if [ "${UNINSTALL_KEEP_DATA:-}" != "1" ] && [ -d "${INSTALL_DIR}" ]; then
-    printf 'Remove the data directory %s too? Enter y to delete, Enter to keep [y/N]: ' "${INSTALL_DIR}"
+  #    收集标记目录 ${HOME}/.devkitai、base 下 .devkitai、安装目录（去重）
+  local md_dir dot_dir keep_data="true" ans
+  md_dir="${HOME}/.devkitai"
+  dot_dir="$(dirname "${INSTALL_DIR}")/.devkitai"
+  local rm_list=""
+  for _d in "${md_dir}" "${dot_dir}" "${INSTALL_DIR}"; do
+    case " ${rm_list} " in *" ${_d} "*) ;; *) rm_list="${rm_list} ${_d}" ;; esac
+  done
+  if [ "${UNINSTALL_KEEP_DATA:-}" != "1" ] && { [ -d "${md_dir}" ] || [ -d "${dot_dir}" ] || [ -d "${INSTALL_DIR}" ]; }; then
+    printf 'The following directories will be removed:\n'
+    for _d in ${rm_list}; do printf '    %s\n' "${_d}"; done
+    printf 'Remove them? Enter y to remove, Enter to keep [y/N]: '
     if read -r ans </dev/tty 2>/dev/null && { [ "${ans}" = "y" ] || [ "${ans}" = "Y" ]; }; then
       keep_data="false"
     fi
@@ -1271,28 +1598,103 @@ cmd_uninstall() {
   # 3) 清理 rc 中的 DevKit AI 区块
   cleanup_rc
 
-  # 4) 清理脚本私有目录与数据目录
-  rm -rf "${HOME}/.devkitai" 2>/dev/null || true
+  # 4) 清理脚本私有目录与数据目录（跟随上方确认）
+  local disp="" _d
+  for _d in ${rm_list}; do
+    [ -n "${disp}" ] && disp="${disp}, "
+    disp="${disp}${_d}"
+  done
   if [ "${keep_data}" = "false" ]; then
-    rm -rf "${INSTALL_DIR}" "${DEVKIT_DIR:-${HOME}/devkit-tools}" 2>/dev/null || true
-    say "Removed data directory: ${INSTALL_DIR}"
+    rm -rf ${rm_list} "${DEVKIT_DIR:-${HOME}/devkit-tools}" 2>/dev/null || true
+    echo "Removed directories: ${disp}"
   else
-    say "Kept data directory as-is: ${INSTALL_DIR} (remove manually if no longer needed)"
+    echo "Kept directories (remove manually if no longer needed): ${disp}"
   fi
 
-  say "DevKit AI uninstall complete"
+  echo "DevKit AI uninstall complete"
 }
 
 # ==================== 入口 ====================
+usage() {
+  cat <<EOF
+    Usage: $0 [all|start|stop|restart|uninstall|-h|--help]
+
+    all        one-click download, install, configure, update and start DevKit AI
+    start      start the devkitai server
+    stop       stop the devkitai server
+    restart    reconfigure and start
+    uninstall  uninstall devkitai
+    -h/--help  show this help; put it after a subcommand to show that subcommand's help
+EOF
+}
+
+# 子命令帮助：显示具体子命令的作用说明（$1 为子命令名）
+cmd_help() {
+  case "$1" in
+    all)
+      cat <<'EOF'
+    all: one-click download, install, configure, update and start DevKit AI
+         full pipeline: download -> install -> configure -> update -> start
+EOF
+      ;;
+    start)
+      cat <<'EOF'
+    start: start the devkitai server
+           polls (up to 60s) until the service port is listening, then prints the access URL
+EOF
+      ;;
+    stop)
+      cat <<'EOF'
+    stop: stop the devkitai server
+EOF
+      ;;
+    restart)
+      cat <<'EOF'
+    restart: reconfigure and start
+            equivalent to: config + start
+EOF
+      ;;
+    uninstall)
+      cat <<'EOF'
+    uninstall: uninstall devkitai
+              stops the server and cleans up commands, environment variables and the data directory
+EOF
+      ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+# 参数规则：$0 [-h|--help] 或 $0 <子命令> [-h|--help]，最多 2 个参数
+#   第二个参数出现在子命令后时必须是 -h/--help（显示该子命令的作用），否则视为用法错误
+if [ "$#" -gt 2 ]; then
+  echo "Usage: $0 [all|start|stop|restart|uninstall|-h|--help]" >&2
+  exit 1
+fi
+if [ "$#" -eq 2 ] && { [ "$2" != "-h" ] && [ "$2" != "--help" ]; }; then
+  echo "Usage: $0 [all|start|stop|restart|uninstall|-h|--help]" >&2
+  exit 1
+fi
+
 case "${1:-all}" in
-  download) cmd_download ;;
-  install)  cmd_install ;;
-  config)   cmd_restart ;;
-  update)   cmd_update ;;
-  start)    cmd_start ;;
-  stop)     cmd_stop ;;
-  restart)  cmd_restart ;;
-  uninstall) cmd_uninstall ;;
-  all)      cmd_download && cmd_install && cmd_config && cmd_update && cmd_start ;;
-  *) echo "Usage: $0 [all|download|install|config|update|start|stop|restart|uninstall]" >&2; exit 1 ;;
+  -h|--help) usage ;;
+  start)
+    if [ "$#" -eq 2 ]; then cmd_help start; else cmd_start; fi
+    ;;
+  stop)
+    if [ "$#" -eq 2 ]; then cmd_help stop; else cmd_stop; fi
+    ;;
+  restart)
+    if [ "$#" -eq 2 ]; then cmd_help restart; else cmd_restart; fi
+    ;;
+  uninstall)
+    if [ "$#" -eq 2 ]; then cmd_help uninstall; else cmd_uninstall; fi
+    ;;
+  all)
+    if [ "$#" -eq 2 ]; then
+      cmd_help all
+    else
+      cmd_download && cmd_install && cmd_config && cmd_update && cmd_start
+    fi
+    ;;
+  *) echo "Usage: $0 [all|start|stop|restart|uninstall|-h|--help]" >&2; exit 1 ;;
 esac
