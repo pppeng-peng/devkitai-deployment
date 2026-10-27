@@ -70,9 +70,7 @@ extract_fname() {
 devkitai_fname="${DEVKITAI_FNAME:-$(extract_fname "${DEVKITAI_URL}")}"
 tui_fname="${TUI_FNAME:-$(extract_fname "${TUI_URL}")}"
 
-# 增强型查找：宽松递归查找 devkitai 可执行文件
-# 优先级：当前激活的 INSTALL_DIR（自定义 base 后可能不再位于 ~/devkitai）优先；
-#         后续为历史部署兼容回退，仅在 INSTALL_DIR 下未找到时才使用。
+# 查找 devkitai 可执行文件：优先直接路径/解压顶层目录，miss 时在 INSTALL_DIR 下递归兜底。
 find_devkitai_bin() {
   # 1. 直接检查安装根目录（INSTALL_DIR 优先，随自定义 base 变化）
   if [ -x "${INSTALL_DIR}/devkitai" ]; then
@@ -80,49 +78,21 @@ find_devkitai_bin() {
     return 0
   fi
 
-  # 2. 解压包顶层目录
-  if [ -n "${devkitai_fname}" ]; then
-    local top
-    top="${INSTALL_DIR}/$(basename "${devkitai_fname}" .tar.gz)"
-    if [ -x "${top}/devkitai" ]; then
-      echo "${top}/devkitai"
-      return 0
-    fi
+  # 2. 包解压顶层目录：tar 包内顶层目录名与包文件名无关（如文件名带 .B025 而包内目录不带），
+  #    直接扫描 INSTALL_DIR 下不超过 2 层的 devkitai，不按包名推导目录。
+  local top_hit
+  top_hit="$(find "${INSTALL_DIR}" -maxdepth 2 -type f -name devkitai -perm -u+x 2>/dev/null | head -n 1)"
+  if [ -n "${top_hit}" ]; then
+    echo "${top_hit}"
+    return 0
   fi
 
   # 3. 递归查找 INSTALL_DIR 下任意深度的 devkitai 可执行文件
+  #    权限判定用 -u+x（属主可执行即可）：解压包为 -rwx------，-perm -111 要求 ugo 全设会漏。
   local hit
-  hit="$(find "${INSTALL_DIR}" -maxdepth 5 -type f -name devkitai -perm -111 2>/dev/null | head -n 1)"
+  hit="$(find "${INSTALL_DIR}" -maxdepth 5 -type f -name devkitai -perm -u+x 2>/dev/null | head -n 1)"
   if [ -n "${hit}" ]; then
     echo "${hit}"
-    return 0
-  fi
-
-  # 4. 历史部署兼容回退：~/devkitai 下的历史版本安装、递归与兜底
-  local exact_path="${HOME}/devkitai/DevKit-AI-26.2.RC1-Linux-Kunpeng/devkitai"
-  if [ -x "${exact_path}" ]; then
-    echo "${exact_path}"
-    return 0
-  fi
-
-  local exact_path="${HOME}/devkitai/DevKit-AI-26.2.T103-Linux-Kunpeng/devkitai"
-  if [ -x "${exact_path}" ]; then
-    echo "${exact_path}"
-    return 0
-  fi
-
-  local home_dir="${HOME}/devkitai"
-  if [ -d "${home_dir}" ]; then
-    local home_hit
-    home_hit="$(find "${home_dir}" -type f -name devkitai -perm -111 2>/dev/null | head -n 1)"
-    if [ -n "${home_hit}" ]; then
-      echo "${home_hit}"
-      return 0
-    fi
-  fi
-
-  if [ -x "${HOME}/devkitai/devkitai" ]; then
-    echo "${HOME}/devkitai/devkitai"
     return 0
   fi
 
