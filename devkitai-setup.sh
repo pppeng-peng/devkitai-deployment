@@ -692,18 +692,23 @@ PYX
   ask_val "base_url"       CHAT_BASE_URL "${CHAT_BASE_URL}"
 
   # 4. api_key：新版要求先经 ./devkitai encrypt 加密成密文，才能写入 config.yaml 的 api_key 字段。
-  #    已有密文则回车保留，输入 y 重新加密；未设置时直接调用 encrypt 子命令交互加密。
+  #    已有密文则回车保留，输入 y 重新加密；未设置时输入 y 调用 encrypt，输入 n/回车跳过（保持为空）。
   local key_choice=""
   CHAT_API_KEY_ENC="${CHAT_API_KEY_ENC:-${cur_key}}"
   if [ -n "${CHAT_API_KEY_ENC}" ]; then
     printf '    %-20s [****%s] (Enter to keep / y to re-encrypt): ' "api_key" "${CHAT_API_KEY_ENC: -4}"
+    IFS= read -r key_choice </dev/tty || true
+    key_choice="$(printf '%s' "${key_choice}" | tr -d ' ' | tr '[:upper:]' '[:lower:]')"
+    if [ "${key_choice}" = "y" ]; then
+      CHAT_API_KEY_ENC="$(encrypt_api_key)"
+    fi
   else
-    printf '    %-20s [not set] (Press Enter to call ./devkitai encrypt): ' "api_key"
-  fi
-  IFS= read -r key_choice </dev/tty || true
-  key_choice="$(printf '%s' "${key_choice}" | tr -d ' ' | tr '[:upper:]' '[:lower:]')"
-  if [ -z "${CHAT_API_KEY_ENC}" ] || [ "${key_choice}" = "y" ]; then
-    CHAT_API_KEY_ENC="$(encrypt_api_key)"
+    printf '    %-20s [not set] (y to run ./devkitai encrypt / n or Enter to skip): ' "api_key"
+    IFS= read -r key_choice </dev/tty || true
+    key_choice="$(printf '%s' "${key_choice}" | tr -d ' ' | tr '[:upper:]' '[:lower:]')"
+    if [ "${key_choice}" = "y" ]; then
+      CHAT_API_KEY_ENC="$(encrypt_api_key)"
+    fi
   fi
   export CHAT_API_KEY_ENC
 
@@ -865,7 +870,7 @@ need = {k: v for k, v in {
     "model_provider": os.environ.get("CHAT_MODEL_PROVIDER", "openai"),
     "base_url": os.environ.get("CHAT_BASE_URL", "https://api.deepseek.com"),
     "api_key": os.environ.get("CHAT_API_KEY_ENC", ""),
-}.items() if v}
+}.items() if v or k == "api_key"}
 
 lines = open(src, encoding="utf-8").read().splitlines()
 
@@ -1584,6 +1589,25 @@ cmd_uninstall() {
   echo "DevKit AI uninstall complete"
 }
 
+# ==================== 终端退格兼容 ====================
+# Xshell 的 Backspace 发送 ^H(0x08)，默认终端 erase 是 DEL(^?)，两者不匹配时整行 read
+# 输入退格会回显成 ^H 而非删除字符。参照 Python 端 termios 处理（ICANON|ECHO 保持
+# 规范模式+回显，VERASE='\x08'）：保存启动前属性 -> 设置 icanon echo erase '^H'，
+# 退出/中断（EXIT/INT/TERM/HUP）时恢复，避免污染 shell 的退格配置。
+TERM_ATTRS_SAVED=""
+setup_terminal() {
+  TERM_ATTRS_SAVED="$(stty -F /dev/tty -g 2>/dev/null || true)"
+  if [ -n "${TERM_ATTRS_SAVED}" ]; then
+    stty -F /dev/tty icanon echo erase '^H' 2>/dev/null || true
+  fi
+}
+restore_terminal() {
+  if [ -n "${TERM_ATTRS_SAVED}" ]; then
+    stty -F /dev/tty "${TERM_ATTRS_SAVED}" 2>/dev/null || true
+    TERM_ATTRS_SAVED=""
+  fi
+}
+
 # ==================== 入口 ====================
 usage() {
   cat <<EOF
@@ -1633,6 +1657,10 @@ EOF
     *) usage >&2; exit 1 ;;
   esac
 }
+
+# 交互前先对齐退格 erase 字符并注册退出恢复（非 tty 时自动跳过）
+setup_terminal
+trap 'restore_terminal' EXIT INT TERM HUP
 
 # 参数规则：$0 [-h|--help] 或 $0 <子命令> [-h|--help]，最多 2 个参数
 #   第二个参数出现在子命令后时必须是 -h/--help（显示该子命令的作用），否则视为用法错误
